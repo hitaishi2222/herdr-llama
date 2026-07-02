@@ -1,0 +1,26 @@
+id = "herdr.llama-server"
+name = "Llama Server Agent"
+version = "0.1.0"
+min_herdr_version = "0.7.0"
+description = "Integrate llama-server as a Herdr agent with stats dashboard"
+platforms = ["linux", "macos"]
+
+[[build]]
+command = ["pip", "install", "-r", "requirements.txt"]
+
+[[actions]]
+id = "open-dashboard"
+title = "Llama Server Dashboard"
+command = ["./bin/herdr-llama"]
+
+[[keys.command]]
+key = "alt+l"
+type = "plugin_action"
+command = "herdr.llama-server.open-dashboard"
+description = "Open llama-server dashboard (alt+l)"
+
+[[panes]]
+id = "dashboard"
+title = "Llama Server Dashboard"
+placement = "overlay"
+command = ["/usr/bin/env", "python3", "./herdr-llama.py"]

@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# Wrapper to open herdr overlay pane and run herdr-llama inside it.
+# Captures the current tab_id before opening the overlay so the Python
+# script can refocus that tab after model selection.
+
+set -eu
+herdr="${HERDR_BIN_PATH:-herdr}"
+
+# Capture the tab focused before the overlay opens.
+original_tab_id="$(herdr pane current 2>/dev/null | jq -r '.result.pane.tab_id')"
+export HERDR_TAB_ID="$original_tab_id"
+
+exec "$herdr" plugin pane open --plugin herdr.llama-server --entrypoint dashboard --placement overlay --focus
