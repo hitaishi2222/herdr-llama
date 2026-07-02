@@ -9,10 +9,11 @@ import configparser
 import json
 import logging
 import os
+import re
 import subprocess
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import httpx
@@ -121,8 +122,8 @@ class Herdr:
     """Wraps the herdr CLI — keeps a snapshot of workspaces/tabs/panes and
     running processes for easy interaction."""
 
-    tree: dict = None
-    process: list[tuple[str, str]] = None
+    tree: dict[str, dict] = field(default_factory=dict)
+    process: list[tuple[str, str]] = field(default_factory=list)
 
     def __post_init__(self):
         self.tree = {}
@@ -144,7 +145,7 @@ class Herdr:
             data = json.loads(result.stdout)
             return data.get("result", {})
         except (json.JSONDecodeError, KeyError):
-            logger.debug("Invalid JSON from herdr %s", " ".join(args))
+            logger.debug("Invalid JSON from herdr")
             return None
 
     # -- Tree refresh ------------------------------------------------------
@@ -306,13 +307,21 @@ class Herdr:
 
     # -- Agent reporting ---------------------------------------------------
 
+    def read_pane_source(self, pane_id: str, source: str, lines: int = 2) -> str:
+        """Read recent output from a pane source."""
+        result = self._herdr("pane", "read", pane_id, "--source", source, "--lines", str(lines))
+        if result.returncode != 0:
+            logger.debug("Failed to read pane %s source %s: %s", pane_id, source, result.stderr.strip())
+            return ""
+        return result.stdout.strip()
+
     def report_agent(
         self,
         pane_id: str,
         agent: str,
         state: str,
         message: str = "",
-        custom_status: str = "",
+        state_level: str = "info",
     ) -> bool:
         cmd = [
             "pane",
@@ -324,11 +333,11 @@ class Herdr:
             agent,
             "--state",
             state,
+            "--state-level",
+            state_level,
         ]
         if message:
             cmd.extend(["--message", message])
-        if custom_status:
-            cmd.extend(["--custom-status", custom_status])
         result = self._herdr(*cmd)
         if result.returncode != 0:
             logger.warning(
@@ -376,11 +385,12 @@ class AgentState:
     agent: str
     state: str  # "idle" | "working" | "blocked"
     message: str = ""
-    custom_status: str = ""
+    state_level: str = "on"  # "on" | "warning" | "error" | <tps> | <percent> (progress)
 
 
 class AgentReporter:
-    def __init__(self, herdr_bin_path: str | None = None, tab_id: str | None = None):
+    def __init__(self, herdr: Herdr | None = None, herdr_bin_path: str | None = None, tab_id: str | None = None):
+        self.herdr = herdr
         self.herdr_bin = herdr_bin_path or os.environ.get("HERDR_BIN_PATH", "herdr")
         self.tab_id = tab_id or os.environ.get("HERDR_PANE_ID", "")
 
@@ -400,11 +410,11 @@ class AgentReporter:
             state.agent,
             "--state",
             state.state,
+            "--state-level",
+            state.state_level,
         ]
         if state.message:
             cmd.extend(["--message", state.message])
-        if state.custom_status:
-            cmd.extend(["--custom-status", state.custom_status])
 
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
@@ -426,16 +436,23 @@ class AgentReporter:
             logger.error("Failed to report agent state: %s", e)
             return False
 
+
+
+    def notify(self, message: str) -> None:
+        cmd = [self.herdr_bin, "notification", "show", message]
+        try:
+            subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        except Exception:
+            logger.debug("Failed to send notification")
+
     def report_metadata(
         self,
-        title: str = "",
-        display_agent: str = "",
-        custom_status: str = "",
-        state_label: str = "",
+        title: str | None = None,
+        custom_status: str | None = None,
+        state_label: str | None = None,
     ) -> bool:
-        """Report display-only metadata (title, display-agent, custom-status)."""
+        """Report display metadata (title, custom-status, state-labels)."""
         if not self.tab_id:
-            logger.warning("No tab_id set, skipping report-metadata")
             return False
         cmd = [
             self.herdr_bin,
@@ -445,19 +462,17 @@ class AgentReporter:
             "--source",
             AGENT_SOURCE,
         ]
-        if title:
+        if title is not None:
             cmd.extend(["--title", title])
-        if display_agent:
-            cmd.extend(["--display-agent", display_agent])
-        if custom_status:
+        if custom_status is not None:
             cmd.extend(["--custom-status", custom_status])
-        if state_label:
+        if state_label is not None:
             cmd.extend(["--state-label", state_label])
 
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
             if result.returncode != 0:
-                logger.warning(
+                logger.debug(
                     "herdr report-metadata failed (rc=%d): %s",
                     result.returncode,
                     result.stderr.strip(),
@@ -473,13 +488,6 @@ class AgentReporter:
         except Exception as e:
             logger.error("Failed to report metadata: %s", e)
             return False
-
-    def notify(self, message: str) -> None:
-        cmd = [self.herdr_bin, "notification", "show", message]
-        try:
-            subprocess.run(cmd, capture_output=True, text=True, timeout=10)
-        except Exception:
-            logger.debug("Failed to send notification")
 
 
 # ---------------------------------------------------------------------------
@@ -669,11 +677,12 @@ class LlamaClient:
                     continue
                 seen.add(key)
                 name = parser.get("models", key).strip()
-                ctx = parser.get("models", f"{key}.context_size", fallback=None)
+                ctx_raw = parser.get("models", f"{key}.context_size", fallback=None)
                 url = parser.get("models", f"{key}.url", fallback=None)
-                if ctx:
+                ctx: int | None = None
+                if ctx_raw:
                     try:
-                        ctx = int(ctx)
+                        ctx = int(ctx_raw)
                     except ValueError:
                         ctx = None
                 models.append(PresetModel(id=key, name=name, context_size=ctx, url=url))
@@ -682,11 +691,12 @@ class LlamaClient:
                 if section == "DEFAULT":
                     continue
                 name = parser.get(section, "name", fallback=section)
-                ctx = parser.get(section, "context_size", fallback=None)
+                ctx_raw = parser.get(section, "context_size", fallback=None)
                 url = parser.get(section, "url", fallback=None)
-                if ctx:
+                ctx = None
+                if ctx_raw:
                     try:
-                        ctx = int(ctx)
+                        ctx = int(ctx_raw)
                     except ValueError:
                         ctx = None
                 models.append(
@@ -728,7 +738,11 @@ def _start_llama_in_focused_tab(config: Config, herdr: Herdr) -> str | None:
         logger.error("No pane found in created tab %s", tab_id)
         return None
 
-    return _run_llama_in_tab(config, pane.get("pane_id"), herdr)
+    pane_id = pane.get("pane_id")
+    if not pane_id:
+        logger.error("No pane_id in tab %s", tab_id)
+        return None
+    return _run_llama_in_tab(config, pane_id, herdr)
 
 
 def _start_llama_in_workspace(config: Config, herdr: Herdr) -> str | None:
@@ -757,7 +771,11 @@ def _start_llama_in_workspace(config: Config, herdr: Herdr) -> str | None:
         logger.error("No pane found in workspace tab %s", tab_id)
         return None
 
-    return _run_llama_in_tab(config, pane.get("pane_id"), herdr)
+    pane_id = pane.get("pane_id")
+    if not pane_id:
+        logger.error("No pane_id in workspace tab %s", tab_id)
+        return None
+    return _run_llama_in_tab(config, pane_id, herdr)
 
 
 def _run_llama_in_tab(config: Config, pane_id: str, herdr: Herdr) -> str | None:
@@ -822,11 +840,16 @@ class WatcherStats:
 
 class Watcher:
     def __init__(
-        self, client: LlamaClient, reporter: AgentReporter, model_name: str = "unknown"
+        self,
+        client: LlamaClient,
+        reporter: AgentReporter,
+        model_name: str = "unknown",
+        herdr: Herdr | None = None,
     ):
         self.client = client
         self.reporter = reporter
         self.model_name = model_name
+        self.herdr = herdr
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
         self._stats = WatcherStats()
@@ -860,8 +883,14 @@ class Watcher:
             except ServerNotRunningError:
                 consecutive_errors += 1
                 self._stats.error = "server not responding"
-                self._report_state(
-                    "blocked", f"server offline (retry {consecutive_errors})"
+                # ponytail: use report-agent for state change to blocked
+                self.reporter.report(
+                    AgentState(
+                        agent=self.model_name,
+                        state="blocked",
+                        message=f"server offline (retry {consecutive_errors})",
+                        state_level="error",
+                    )
                 )
                 if consecutive_errors >= CONNECTION_RETRY_MAX:
                     self.reporter.notify(
@@ -893,40 +922,95 @@ class Watcher:
             self._stats.slots_active = 0
 
         state = self._determine_state()
-        message, custom_status = self._format_message(state)
-        self._report_state(state, message, custom_status)
+        message = self._format_message(state)
+        state_level = self._determine_state_level()
+
+        # ponytail: use report-metadata for polling updates — state stays
+        # whatever report-agent last set (on/working/blocked)
+        title = f"{self.model_name} — {state}"
+        custom_status = message or state_level
+        self.reporter.report_metadata(title=title, custom_status=custom_status, state_label=state_level)
 
     def _determine_state(self) -> str:
+        # ponytail: use pane output to determine state — more reliable than
+        # /completion endpoint which may not exist on all builds
+        tab_id = self.reporter.tab_id
+        if tab_id and self.herdr:
+            pane = self.herdr.find_pane(tab_id)
+            if pane:
+                pane_id = pane.get("pane_id")
+                if pane_id:
+                    output = self.herdr.read_pane_source(pane_id, "recent-unwrapped", lines=2)
+                    if output:
+                        lines = [l.strip() for l in output.splitlines() if l.strip()]
+                        if lines:
+                            last_line = lines[-1]
+                            if re.search(r"tg\s*=\s*[\d.]+\s*t/s", last_line, re.IGNORECASE):
+                                return "working"
+                            if re.search(r"progress\s*=\s*[\d.]+", last_line, re.IGNORECASE):
+                                return "working"
+                            output_lower = output.lower()
+                            if "error" in output_lower or "fail" in output_lower:
+                                return "blocked"
+
         if self._stats.tokens_per_sec and self._stats.tokens_per_sec > 0:
             return "working"
         return "idle"
 
-    def _format_message(self, state: str) -> tuple[str, str]:
+    def _determine_state_level(self) -> str:
+        """Determine state-level from recent pane output.
+
+        Parses the last non-empty line for llama-server timing patterns:
+        - `tg = X.XX t/s` → `{X.XX} tps`
+        - `progress = X.XX` → `{X:.0f}% (progress)`
+        Falls back to keyword matching for error/warning.
+        """
+        tab_id = self.reporter.tab_id
+        if not tab_id or not self.herdr:
+            return "on"
+        pane = self.herdr.find_pane(tab_id)
+        if not pane:
+            return "on"
+        pane_id = pane.get("pane_id")
+        if not pane_id:
+            return "on"
+        output = self.herdr.read_pane_source(pane_id, "recent-unwrapped", lines=2)
+        if not output:
+            return "on"
+
+        # Get last non-empty line
+        lines = [l.strip() for l in output.splitlines() if l.strip()]
+        if not lines:
+            return "on"
+        last_line = lines[-1]
+
+        # ponytail: parse llama-server timing output for state-level
+        # Match: tg = 18.75 t/s
+        tg_match = re.search(r"tg\s*=\s*([\d.]+)\s*t/s", last_line, re.IGNORECASE)
+        if tg_match:
+            return f"{tg_match.group(1)} tps"
+
+        # Match: progress = 0.93
+        progress_match = re.search(r"progress\s*=\s*([\d.]+)", last_line, re.IGNORECASE)
+        if progress_match:
+            pct = float(progress_match.group(1)) * 100
+            return f"{pct:.0f}% (progress)"
+
+        # Fallback: keyword matching
+        output_lower = output.lower()
+        if "error" in output_lower or "fail" in output_lower:
+            return "error"
+        if "warn" in output_lower:
+            return "warning"
+        return "on"
+
+    def _format_message(self, state: str) -> str:
         if state == "working":
             tps = self._stats.tokens_per_sec or 0
-            return f"{tps:.1f} tok/s", (
-                f"{self._stats.context_usage * 100:.0f}% context"
-                if self._stats.context_usage
-                else ""
-            )
+            return f"{tps:.1f} tok/s"
         elif state == "idle":
-            model = self._stats.model_name or "unknown"
-            return "", f"ready: {model}"
-        return "", ""
-
-    def _report_state(
-        self, state: str, message: str = "", custom_status: str = ""
-    ) -> None:
-        model = self._stats.model_name or self.model_name or "unknown"
-        title = "llama-server"
-        display_agent = model
-        state_label = f"{state}={message}" if state == "working" and message else ""
-        self.reporter.report_metadata(
-            title=title,
-            display_agent=display_agent,
-            custom_status=custom_status or message,
-            state_label=state_label,
-        )
+            return ""
+        return ""
 
 
 # ---------------------------------------------------------------------------
@@ -1016,12 +1100,40 @@ def _unload_model(client: LlamaClient, model_id: str) -> bool:
     return False
 
 
-def _report_agent(reporter: AgentReporter, model_id: str) -> None:
-    reporter.report_metadata(
-        title="llama-server",
-        display_agent=model_id,
-        custom_status=f"ready: {model_id}",
-    )
+def _report_agent(reporter: AgentReporter, model_id: str, pane_id: str, herdr: Herdr | None, state: str = "working") -> None:
+    # ponytail: poll pane for recent output to determine state-level
+    if not herdr:
+        return
+    output = herdr.read_pane_source(pane_id, "recent-unwrapped", lines=2)
+    state_level = _parse_state_level(output)
+    agent_state = AgentState(agent=model_id, state=state, state_level=state_level)
+    reporter.report(agent_state)
+
+
+def _parse_state_level(output: str) -> str:
+    """Parse state-level from pane output using the same logic as Watcher."""
+    if not output:
+        return "on"
+    lines = [l.strip() for l in output.splitlines() if l.strip()]
+    if not lines:
+        return "on"
+    last_line = lines[-1]
+
+    tg_match = re.search(r"tg\s*=\s*([\d.]+)\s*t/s", last_line, re.IGNORECASE)
+    if tg_match:
+        return f"{tg_match.group(1)} tps"
+
+    progress_match = re.search(r"progress\s*=\s*([\d.]+)", last_line, re.IGNORECASE)
+    if progress_match:
+        pct = float(progress_match.group(1)) * 100
+        return f"{pct:.0f}% (progress)"
+
+    output_lower = output.lower()
+    if "error" in output_lower or "fail" in output_lower:
+        return "error"
+    if "warn" in output_lower:
+        return "warning"
+    return "on"
 
 
 def _start_watcher(
@@ -1030,6 +1142,7 @@ def _start_watcher(
     model_id: str,
     tab_id: str,
     original_tab_id: str | None,
+    herdr: Herdr | None = None,
 ) -> Watcher:
     # ponytail: wait for model to be fully loaded before reporting
     if not client.wait_for_model_load(model_id, timeout=120.0):
@@ -1037,7 +1150,9 @@ def _start_watcher(
         raise RuntimeError(f"Model {model_id} failed to load")
     _print_info(f"Model {model_id} loaded, starting watcher")
     reporter.tab_id = tab_id
-    watcher = Watcher(client=client, reporter=reporter, model_name=model_id)
+    # ponytail: agent already reported at server start — just update metadata
+    reporter.report_metadata(title=model_id, custom_status="loaded")
+    watcher = Watcher(client=client, reporter=reporter, model_name=model_id, herdr=herdr)
     watcher.start()
     _print_info(f"Dashboard closing. Watcher running for {model_id} in tab {tab_id}.")
 
@@ -1070,7 +1185,7 @@ def _run_dashboard() -> None:
     herdr = Herdr()
 
     client = LlamaClient(port=config.port)
-    reporter = AgentReporter()
+    reporter = AgentReporter(herdr=herdr)
     models = _load_models(config)
 
     # Capture the original tab_id before we do anything
@@ -1095,6 +1210,9 @@ def _run_dashboard() -> None:
             server_tab_id = tab_id
             reporter.tab_id = tab_id
 
+            # ponytail: report initial state — agent is "Not-loaded", state is idle
+            _report_agent(reporter, "Not-loaded", tab_id, herdr, state="idle")
+
             _print_info(f"Server started in tab {tab_id}")
 
             if not models:
@@ -1106,7 +1224,7 @@ def _run_dashboard() -> None:
                 return
 
             if _load_model(client, model_id):
-                _report_agent(reporter, model_id)
+                reporter.report_metadata(title=model_id, custom_status="loaded")
                 watcher = _start_watcher(
                     client,
                     reporter,
@@ -1138,16 +1256,17 @@ def _run_dashboard() -> None:
                 elif choice == "stop-server":
                     confirm = questionary.select(
                         "Stop server (close pane)?",
-                        choices=["y", "n"],
-                        default="n",
+                        choices=["Yes", "No"],
+                        default="No",
                     ).ask()
-                    if confirm == "y":
+                    if confirm == "Yes":
+                        herdr.refresh()
                         pane = herdr.find_pane(tab_id)
                         if pane:
                             pane_id = pane.get("pane_id")
                             if watcher:
                                 watcher.stop()
-                            if herdr.close_pane(pane_id):
+                            if pane_id and herdr.close_pane(pane_id):
                                 _print_info("Server stopped (pane closed).")
                                 return
                         else:
@@ -1160,7 +1279,7 @@ def _run_dashboard() -> None:
 
                 model_id = _prompt_model_choice(models)
                 if model_id and _load_model(client, model_id):
-                    _report_agent(reporter, model_id)
+                    reporter.report_metadata(title=model_id, custom_status="loaded")
                     _start_watcher(
                         client,
                         reporter,
