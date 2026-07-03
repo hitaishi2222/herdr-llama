@@ -34,7 +34,7 @@ REQUIRED_SECTIONS = ["server"]
 REQUIRED_KEYS = ["llama-server-path", "port"]
 DEFAULT_PORT = 8080
 
-PLUGIN_ID = "herdr.llama-server"
+PLUGIN_ID = "herdr-llama"
 CONFIG_FILENAME = "herdr-llama.ini"
 STATE_DIR = Path.home() / ".config" / "herdr" / "plugins" / "state" / PLUGIN_ID
 SOCKET_PATH = STATE_DIR / "daemon.sock"
@@ -54,6 +54,7 @@ class Config:
     default_model: str | None = None
     open_method: str = "tab"
     log_file_size: int = 5  # KB
+    update_rate: float = 1.0  # seconds
 
     def get_extra_args_list(self) -> list[str]:
         if not self.extra_args:
@@ -95,6 +96,7 @@ def load_config() -> Config:
     models_preset = parser.get("server", "models-preset", fallback=None)
     open_method = parser.get("server", "open-method", fallback="tab")
     log_file_size_raw = parser.get("server", "log-file-size", fallback="5")
+    update_rate_raw = parser.get("server", "update-rate", fallback="1")
 
     port_str = parser.get("server", "port")
     try:
@@ -107,6 +109,13 @@ def load_config() -> Config:
     except ValueError:
         raise ConfigError(f"Invalid log-file-size value: {log_file_size_raw!r}")
 
+    try:
+        update_rate = float(update_rate_raw)
+        if update_rate <= 0:
+            raise ValueError("update-rate must be positive")
+    except ValueError:
+        raise ConfigError(f"Invalid update-rate value: {update_rate_raw!r}")
+
     return Config(
         llama_server_path=parser.get("server", "llama-server-path"),
         models_preset=models_preset,
@@ -115,6 +124,7 @@ def load_config() -> Config:
         default_model=default_model,
         open_method=open_method,
         log_file_size=log_file_size,
+        update_rate=update_rate,
     )
 
 
@@ -176,16 +186,9 @@ class Herdr:
         ]
         if message:
             cmd.extend(["--message", message])
-        logger.info("[HERDR-CMD] report-agent: %s", " ".join(cmd))
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
         if result.returncode != 0:
-            logger.error(
-                "[HERDR-CMD] report-agent failed (rc=%d): %s",
-                result.returncode,
-                result.stderr.strip(),
-            )
             return False
-        logger.info("[HERDR-CMD] report-agent: ok")
         return True
 
     def report_metadata(
@@ -206,16 +209,9 @@ class Herdr:
             cmd.extend(["--title", title])
         if state_label is not None:
             cmd.extend(["--state-label", state_label])
-        logger.info("[HERDR-CMD] report-metadata: %s", " ".join(cmd))
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
         if result.returncode != 0:
-            logger.error(
-                "[HERDR-CMD] report-metadata failed (rc=%d): %s",
-                result.returncode,
-                result.stderr.strip(),
-            )
             return False
-        logger.info("[HERDR-CMD] report-metadata: ok")
         return True
 
     def read_pane_source(
@@ -417,17 +413,21 @@ class Watcher:
         herdr: Herdr,
         pane_id: str,
         daemon: Optional["Daemon"] = None,
+        update_rate: float = 1.0,
     ):
         self.client = client
         self.herdr = herdr
         self.pane_id = pane_id
         self.daemon = daemon
+        self.update_rate = update_rate
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
         self._stats = WatcherStats()
         self._last_state = "idle"
         self._last_model: str | None = None
         self._consecutive_errors = 0
+        self._last_reported_agent_state: str | None = None
+        self._last_reported_label: str | None = None
 
     @property
     def stats(self) -> WatcherStats:
@@ -454,7 +454,7 @@ class Watcher:
             try:
                 self._poll_once()
                 self._consecutive_errors = 0
-                time.sleep(POLL_INTERVAL)
+                time.sleep(self.update_rate)
             except Exception as e:
                 self._consecutive_errors += 1
                 self._stats.error = str(e)
@@ -483,6 +483,16 @@ class Watcher:
 
         self._stats.server_running = True
         self._stats.error = None
+
+        # Server recovered from offline — re-read pane state and report
+        # so the label updates from any stale "blocked" label.
+        if self.pane_id and not server_was_online:
+            state, label = self._read_pane_state()
+            self._stats.state = state
+            if state != self._last_reported_agent_state:
+                self._report_state(state, "")
+            if label != self._last_reported_label:
+                self._report_metadata(state, label)
 
         model_info = self.client.get_model_info()
         current_model = model_info.get("id") if model_info else None
@@ -520,7 +530,14 @@ class Watcher:
             elif current_model and self._last_model is None:
                 with self.daemon._lock:
                     self.daemon.current_model = current_model
-                    self.daemon.state = DaemonState.SERVER_RUNNING
+                    # Honor the state set by load_model() (MODEL_LOADING)
+                    # or detect immediate load. Don't override to SERVER_RUNNING.
+                    if self.daemon.state == DaemonState.MODEL_LOADING:
+                        pass  # keep MODEL_LOADING, watcher will transition when loaded
+                    elif self.client.is_model_loaded():
+                        self.daemon.state = DaemonState.MODEL_LOADED
+                    else:
+                        self.daemon.state = DaemonState.MODEL_LOADING
             elif not current_model and self._last_model is None:
                 with self.daemon._lock:
                     if self.daemon.state == DaemonState.NO_SERVER:
@@ -535,6 +552,9 @@ class Watcher:
                             "Watcher detected model finished loading: %s", current_model
                         )
                         self.daemon.state = DaemonState.MODEL_LOADED
+                        # Confirm via /models — report loaded state
+                        self._report_state("unknown", "")
+                        self._report_metadata("unknown", "Loaded")
             elif self.daemon.state == DaemonState.MODEL_LOADING and not current_model:
                 with self.daemon._lock:
                     logger.info("Watcher detected model load failed")
@@ -557,59 +577,59 @@ class Watcher:
         if self.pane_id:
             state, label = self._read_pane_state()
             self._stats.state = state
-            logger.info("[POLL-ONCE] pane_state=%s label=%r", state, label)
-            # report-agent sets the agent state
-            self._report_state(state, "")
-            # report-metadata sets the visible label
-            self._report_metadata(state, label)
+
+            # Only report if state or label actually changed
+            agent_state_changed = state != self._last_reported_agent_state
+            label_changed = label != self._last_reported_label
+            if agent_state_changed:
+                self._report_state(state, "")
+            if label_changed:
+                self._report_metadata(state, label)
 
     def _read_pane_state(self) -> tuple[str, str]:
-        """Read pane output and derive (herdr_state, label) from the last line.
-
-        Priority (first match wins):
-          - 'stop processing'     → ('idle', 'ready')
-          - 'tg = X.XX t/s'       → ('working', 'X.X tps')
-          - loading JSON line     → ('working', 'Loading(XX%)')
-          - anything else          → ('idle', 'on')
-        """
+        """Find all signals in output, return the last (most recent) match."""
         if not self._stats.server_running or not self.pane_id:
             return "idle", "on"
 
         output = self.herdr.read_pane_source(self.pane_id, "visible", lines=5)
-
-        # Active inference: 'tg = XX.XX t/s'
-        m = re.search(r"tg\s*=\s*([\d.]+)\s*t/s", output)
-        if m:
-            return "working", f"{float(m.group(1)):.1f} tps"
-
-        # Loading progress: JSON line with state="loading" and payload.value
-        # Pane output may have prefix like "[42555] cmd_child_to_router:state:" before JSON
-        for line in output.rsplit("\n", 5):
-            line = line.strip()
-            if not line:
-                continue
-            # Extract JSON from line (may have prefix)
-            json_start = line.find("{")
-            if json_start == -1:
-                continue
-            try:
-                data = json.loads(line[json_start:])
-            except (json.JSONDecodeError, ValueError):
-                continue
-            if data.get("state") == "loading":
-                payload = data.get("payload", {})
-                value = payload.get("value")
-                if isinstance(value, (int, float)):
-                    pct = int(value * 100)
-                    return "working", f"Loading({pct}%)"
-
-        # Slot released → idle
-        if "stop processing" in output:
-            return "idle", "ready"
-
-        if not output:
+        lines = output.splitlines()
+        if not lines:
+            if self._last_reported_agent_state:
+                return self._last_reported_agent_state, self._last_reported_label or "on"
             return "idle", "on"
 
+        last_line = lines[-1].strip()
+
+        # Parse the last line only.
+        tg = re.search(r"tg\s*=\s*([\d.]+)\s*t/s", last_line)
+        if tg:
+            return "working", f"{float(tg.group(1)):.1f} tps"
+
+        proc = re.search(r"process\s*=\s*([\d.]+)\s*t/s", last_line)
+        if proc:
+            return "working", f"{float(proc.group(1)):.1f} tps"
+
+        progress = re.search(r"progress\s*=\s*([\d.]+)", last_line)
+        if progress:
+            return "working", f"Processing({int(float(progress.group(1)) * 100)}%)"
+
+        m = re.search(r"\{.*\}", last_line)
+        if m:
+            try:
+                data = json.loads(m.group())
+                if data.get("state") == "loading":
+                    val = data.get("payload", {}).get("value")
+                    if isinstance(val, (int, float)):
+                        return "working", f"Loading({int(val * 100)}%)"
+            except (json.JSONDecodeError, ValueError):
+                pass
+
+        if "stop processing" in last_line:
+            return "idle", "ready"
+
+        # No signal — keep last known state.
+        if self._last_reported_agent_state:
+            return self._last_reported_agent_state, self._last_reported_label or "on"
         return "idle", "on"
 
     def _report_state(self, state: str, message: str) -> None:
@@ -618,15 +638,10 @@ class Watcher:
         valid_state = (
             state if state in ("idle", "working", "blocked", "unknown") else "unknown"
         )
-        logger.info(
-            "[REPORT-AGENT] pane=%s agent=%s state=%s message=%s",
-            self.pane_id,
-            model_name,
-            valid_state,
-            message,
-        )
+
         self.herdr.report_agent(self.pane_id, model_name, valid_state, message)
         self._last_state = state
+        self._last_reported_agent_state = valid_state
 
     def _report_metadata(self, state: str, label: str) -> None:
         """Update metadata with state-label (state must be set first via report-agent)."""
@@ -634,17 +649,12 @@ class Watcher:
         title = f"{model_name} — {state}"
         label_value = f"{state}={label}"
 
-        logger.info(
-            "[REPORT-METADATA] pane=%s title=%s state_label=%s",
-            self.pane_id,
-            title,
-            label_value,
-        )
         self.herdr.report_metadata(
             self.pane_id,
             title=title,
             state_label=label_value,
         )
+        self._last_reported_label = label_value
 
 
 # ---------------------------------------------------------------------------
@@ -823,6 +833,7 @@ class Daemon:
             herdr=self.herdr,
             pane_id=self.pane_id,
             daemon=self,
+            update_rate=self.config.update_rate,
         )
         self.watcher.start()
 

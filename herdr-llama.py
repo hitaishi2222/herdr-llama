@@ -24,7 +24,7 @@ from pathlib import Path
 
 from InquirerPy import inquirer
 
-PLUGIN_ID = "herdr.llama-server"
+PLUGIN_ID = "herdr-llama"
 CONFIG_FILENAME = "herdr-llama.ini"
 STATE_DIR = Path.home() / ".config" / "herdr" / "plugins" / "state" / PLUGIN_ID
 SOCKET_PATH = STATE_DIR / "daemon.sock"
