@@ -13,6 +13,7 @@ import configparser
 import json
 import logging
 import os
+import re
 import signal
 import socket
 import subprocess
@@ -52,6 +53,7 @@ class Config:
     extra_args: str | None = None
     default_model: str | None = None
     open_method: str = "tab"
+    log_file_size: int = 5  # KB
 
     def get_extra_args_list(self) -> list[str]:
         if not self.extra_args:
@@ -92,12 +94,18 @@ def load_config() -> Config:
     default_model = parser.get("server", "default-model", fallback=None)
     models_preset = parser.get("server", "models-preset", fallback=None)
     open_method = parser.get("server", "open-method", fallback="tab")
+    log_file_size_raw = parser.get("server", "log-file-size", fallback="5")
 
     port_str = parser.get("server", "port")
     try:
         port = int(port_str)
     except ValueError:
         raise ConfigError(f"Invalid port value: {port_str!r}")
+
+    try:
+        log_file_size = int(log_file_size_raw)
+    except ValueError:
+        raise ConfigError(f"Invalid log-file-size value: {log_file_size_raw!r}")
 
     return Config(
         llama_server_path=parser.get("server", "llama-server-path"),
@@ -106,6 +114,7 @@ def load_config() -> Config:
         extra_args=extra_args,
         default_model=default_model,
         open_method=open_method,
+        log_file_size=log_file_size,
     )
 
 
@@ -167,17 +176,22 @@ class Herdr:
         ]
         if message:
             cmd.extend(["--message", message])
+        logger.info("[HERDR-CMD] report-agent: %s", " ".join(cmd))
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
         if result.returncode != 0:
-            logger.debug("report-agent failed: %s", result.stderr.strip())
+            logger.error(
+                "[HERDR-CMD] report-agent failed (rc=%d): %s",
+                result.returncode,
+                result.stderr.strip(),
+            )
             return False
+        logger.info("[HERDR-CMD] report-agent: ok")
         return True
 
     def report_metadata(
         self,
         pane_id: str,
         title: str | None = None,
-        custom_status: str | None = None,
         state_label: str | None = None,
     ) -> bool:
         cmd = [
@@ -190,15 +204,36 @@ class Herdr:
         ]
         if title is not None:
             cmd.extend(["--title", title])
-        if custom_status is not None:
-            cmd.extend(["--custom-status", custom_status])
         if state_label is not None:
             cmd.extend(["--state-label", state_label])
+        logger.info("[HERDR-CMD] report-metadata: %s", " ".join(cmd))
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
         if result.returncode != 0:
-            logger.debug("report-metadata failed: %s", result.stderr.strip())
+            logger.error(
+                "[HERDR-CMD] report-metadata failed (rc=%d): %s",
+                result.returncode,
+                result.stderr.strip(),
+            )
             return False
+        logger.info("[HERDR-CMD] report-metadata: ok")
         return True
+
+    def read_pane_source(
+        self, pane_id: str, source: str = "visible", lines: int = 10
+    ) -> str:
+        """Read recent pane output to detect inference activity."""
+        cmd = [
+            self.herdr_bin,
+            "pane",
+            "read",
+            pane_id,
+            "--source",
+            source,
+            "--lines",
+            str(lines),
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        return result.stdout.strip() if result.returncode == 0 else ""
 
 
 # ---------------------------------------------------------------------------
@@ -355,7 +390,7 @@ class LlamaClient:
 # Watcher
 # ---------------------------------------------------------------------------
 
-POLL_INTERVAL = 2.0
+POLL_INTERVAL = 1.0
 CONNECTION_RETRY_INTERVAL = 5.0
 CONNECTION_RETRY_MAX = 10
 
@@ -370,6 +405,7 @@ class WatcherStats:
     server_running: bool = False
     error: str | None = None
     state: str = "idle"
+    progress: float | None = None
 
 
 class Watcher:
@@ -438,7 +474,8 @@ class Watcher:
         if not self.client.is_running():
             self._stats.server_running = False
             self._stats.error = "server not responding"
-            self._report_state("blocked", "server offline")
+            if self.pane_id:
+                self._report_state("blocked", "server offline")
             if self.daemon and server_was_online:
                 logger.info("Watcher detected server offline")
                 self.daemon.state = DaemonState.NO_SERVER
@@ -458,11 +495,19 @@ class Watcher:
 
         if self.daemon:
             if current_model and self._last_model != current_model:
+                logger.info(
+                    "[STATE-TRANSITION] model changed: %s -> %s, loaded=%s",
+                    self._last_model,
+                    current_model,
+                    self.client.is_model_loaded(),
+                )
                 if self.client.is_model_loaded():
                     logger.info("Watcher detected model loaded: %s", current_model)
                     with self.daemon._lock:
                         self.daemon.current_model = current_model
                         self.daemon.state = DaemonState.MODEL_LOADED
+                    # Register agent with model name and set state to idle
+                    self._report_state("idle", "ready")
                 else:
                     with self.daemon._lock:
                         self.daemon.state = DaemonState.MODEL_LOADING
@@ -482,8 +527,13 @@ class Watcher:
                         self.daemon.state = DaemonState.SERVER_RUNNING
             elif current_model and self._last_model == current_model:
                 with self.daemon._lock:
-                    if self.daemon.state == DaemonState.MODEL_LOADING and self.client.is_model_loaded():
-                        logger.info("Watcher detected model finished loading: %s", current_model)
+                    if (
+                        self.daemon.state == DaemonState.MODEL_LOADING
+                        and self.client.is_model_loaded()
+                    ):
+                        logger.info(
+                            "Watcher detected model finished loading: %s", current_model
+                        )
                         self.daemon.state = DaemonState.MODEL_LOADED
             elif self.daemon.state == DaemonState.MODEL_LOADING and not current_model:
                 with self.daemon._lock:
@@ -504,50 +554,96 @@ class Watcher:
         slots = self.client.get_slots()
         self._stats.slots_active = sum(1 for s in slots if s.get("running"))
 
-        state = self._determine_state_from_output()
-        self._stats.state = state
-        self._report_metadata(state)
+        if self.pane_id:
+            state, label = self._read_pane_state()
+            self._stats.state = state
+            logger.info("[POLL-ONCE] pane_state=%s label=%r", state, label)
+            # report-agent sets the agent state
+            self._report_state(state, "")
+            # report-metadata sets the visible label
+            self._report_metadata(state, label)
 
-    def _determine_state_from_output(self) -> str:
-        """Determine state by reading pane output — but daemon has no pane output access.
-        Fall back to daemon state knowledge."""
-        if self._stats.server_running and self.daemon:
-            with self.daemon._lock:
-                state = self.daemon.state
-            if state == DaemonState.MODEL_LOADED:
-                return "working"
-        return "idle"
+    def _read_pane_state(self) -> tuple[str, str]:
+        """Read pane output and derive (herdr_state, label) from the last line.
+
+        Priority (first match wins):
+          - 'stop processing'     → ('idle', 'ready')
+          - 'tg = X.XX t/s'       → ('working', 'X.X tps')
+          - loading JSON line     → ('working', 'Loading(XX%)')
+          - anything else          → ('idle', 'on')
+        """
+        if not self._stats.server_running or not self.pane_id:
+            return "idle", "on"
+
+        output = self.herdr.read_pane_source(self.pane_id, "visible", lines=5)
+
+        # Active inference: 'tg = XX.XX t/s'
+        m = re.search(r"tg\s*=\s*([\d.]+)\s*t/s", output)
+        if m:
+            return "working", f"{float(m.group(1)):.1f} tps"
+
+        # Loading progress: JSON line with state="loading" and payload.value
+        # Pane output may have prefix like "[42555] cmd_child_to_router:state:" before JSON
+        for line in output.rsplit("\n", 5):
+            line = line.strip()
+            if not line:
+                continue
+            # Extract JSON from line (may have prefix)
+            json_start = line.find("{")
+            if json_start == -1:
+                continue
+            try:
+                data = json.loads(line[json_start:])
+            except (json.JSONDecodeError, ValueError):
+                continue
+            if data.get("state") == "loading":
+                payload = data.get("payload", {})
+                value = payload.get("value")
+                if isinstance(value, (int, float)):
+                    pct = int(value * 100)
+                    return "working", f"Loading({pct}%)"
+
+        # Slot released → idle
+        if "stop processing" in output:
+            return "idle", "ready"
+
+        if not output:
+            return "idle", "on"
+
+        return "idle", "on"
 
     def _report_state(self, state: str, message: str) -> None:
+        """Update agent state via report-agent (required before state-label)."""
         model_name = self._stats.model_name or "unknown"
-        self.herdr.report_agent(self.pane_id, model_name, state, message)
+        valid_state = (
+            state if state in ("idle", "working", "blocked", "unknown") else "unknown"
+        )
+        logger.info(
+            "[REPORT-AGENT] pane=%s agent=%s state=%s message=%s",
+            self.pane_id,
+            model_name,
+            valid_state,
+            message,
+        )
+        self.herdr.report_agent(self.pane_id, model_name, valid_state, message)
         self._last_state = state
 
-    def _report_metadata(self, state: str) -> None:
+    def _report_metadata(self, state: str, label: str) -> None:
+        """Update metadata with state-label (state must be set first via report-agent)."""
         model_name = self._stats.model_name or "unknown"
+        title = f"{model_name} — {state}"
+        label_value = f"{state}={label}"
 
-        if state == "working":
-            title = f"{model_name} — working"
-            custom_status = (
-                f"{self._stats.tokens_per_sec or 0:.1f} tok/s"
-                if self._stats.tokens_per_sec
-                else "on"
-            )
-            state_label = "on"
-        elif state == "idle":
-            title = f"{model_name} — idle"
-            custom_status = "ready"
-            state_label = "on"
-        else:
-            title = f"{model_name} — {state}"
-            custom_status = self._stats.error or state
-            state_label = "on"
-
+        logger.info(
+            "[REPORT-METADATA] pane=%s title=%s state_label=%s",
+            self.pane_id,
+            title,
+            label_value,
+        )
         self.herdr.report_metadata(
             self.pane_id,
             title=title,
-            custom_status=custom_status,
-            state_label=state_label,
+            state_label=label_value,
         )
 
 
@@ -586,7 +682,22 @@ class Daemon:
             self.tab_id = tab_id
             self.pane_id = pane_id
         logger.info("Pane set: tab=%s pane=%s", tab_id, pane_id)
+
+        # Register agent once with herdr (creates the glacial widget overview)
+        self.herdr.report_agent(
+            pane_id,
+            agent="llama-server",
+            state="idle",
+            message="ready",
+        )
+
         self._start_watcher()
+
+        # If a model is already loaded, report metadata immediately so the
+        # title shows up as soon as we know which pane to report to.
+        if self.client.is_model_loaded():
+            self._report_state("idle", "ready")
+            self._report_metadata(self._stats.state or "idle")
 
     def start(self) -> bool:
         """Start the daemon polling loop."""
@@ -628,7 +739,10 @@ class Daemon:
                 logger.error("Cannot load model in state %s", self.state)
                 return False
 
-            if self.current_model == model_id and self.state == DaemonState.MODEL_LOADED:
+            if (
+                self.current_model == model_id
+                and self.state == DaemonState.MODEL_LOADED
+            ):
                 logger.info("Model %s already loaded", model_id)
                 return True
 
@@ -718,7 +832,9 @@ class Daemon:
 # ---------------------------------------------------------------------------
 
 
-def handle_client(conn: socket.socket, daemon: Daemon, server_socket: socket.socket) -> None:
+def handle_client(
+    conn: socket.socket, daemon: Daemon, server_socket: socket.socket
+) -> None:
     try:
         data = conn.recv(4096)
         if not data:
@@ -870,6 +986,45 @@ def _send_command(command: str) -> dict:
             pass
 
 
+def _check_log_size() -> None:
+    """Check if log file exceeds size limit and truncate if necessary."""
+    if not LOG_FILE.exists():
+        return
+
+    size_bytes = LOG_FILE.stat().st_size
+    size_kb = size_bytes / 1024
+
+    # Get config to check the limit
+    try:
+        config = load_config()
+        limit_kb = config.log_file_size
+    except ConfigError:
+        limit_kb = 5  # Default if config not available
+
+    if size_kb > limit_kb:
+        logger.info(
+            "Log file too large (%.1f KB > %d KB), truncating", size_kb, limit_kb
+        )
+        # Notify user
+        try:
+            subprocess.run(
+                [
+                    "herdr",
+                    "notification",
+                    "show",
+                    "herdr-llama",
+                    "--body",
+                    f"Log file was {size_kb:.0f} KB (limit: {limit_kb} KB). Truncated for this session.",
+                ],
+                capture_output=True,
+                timeout=10,
+            )
+        except Exception:
+            pass
+        # Truncate the log file
+        LOG_FILE.write_text("")
+
+
 def _start_daemon():
     """Start daemon in background."""
     if _is_daemon_running():
@@ -894,6 +1049,9 @@ def _start_daemon():
 
     if _check_config() is None:
         sys.exit(1)
+
+    # Check log file size and truncate if necessary
+    _check_log_size()
 
     try:
         daemon = Daemon()
@@ -968,6 +1126,9 @@ def _show_status():
 
 def _run_foreground():
     """Run daemon in foreground (for debugging)."""
+    # Check log file size and truncate if necessary
+    _check_log_size()
+
     try:
         daemon = Daemon()
         if not daemon.start():

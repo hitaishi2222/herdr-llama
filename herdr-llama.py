@@ -909,8 +909,12 @@ def _run_dashboard() -> None:
                 "Stop server (close pane)?", choices=["Yes", "No"], default="Yes"
             )
             if confirm == "Yes":
+                # Kill the llama-server process and close the pane/tab
                 server_mgr = ServerManager(config, herdr)
+                server_mgr.tab_id = tab_id
+                server_mgr.pane_id = pane_id
                 if server_mgr.stop():
+                    _close_daemon_gracefully()
                     _notify("Server stopped")
                 else:
                     _notify("Failed to stop")
