@@ -55,6 +55,7 @@ class Config:
     open_method: str = "tab"
     log_file_size: int = 5  # KB
     update_rate: float = 1.0  # seconds
+    logs: bool = False
 
     def get_extra_args_list(self) -> list[str]:
         if not self.extra_args:
@@ -97,6 +98,7 @@ def load_config() -> Config:
     open_method = parser.get("server", "open-method", fallback="tab")
     log_file_size_raw = parser.get("server", "log-file-size", fallback="5")
     update_rate_raw = parser.get("server", "update-rate", fallback="1")
+    logs_raw = parser.get("server", "logs", fallback="false")
 
     port_str = parser.get("server", "port")
     try:
@@ -116,6 +118,8 @@ def load_config() -> Config:
     except ValueError:
         raise ConfigError(f"Invalid update-rate value: {update_rate_raw!r}")
 
+    logs = logs_raw.strip().lower() not in ("false", "no", "0", "off")
+
     return Config(
         llama_server_path=parser.get("server", "llama-server-path"),
         models_preset=models_preset,
@@ -125,6 +129,7 @@ def load_config() -> Config:
         open_method=open_method,
         log_file_size=log_file_size,
         update_rate=update_rate,
+        logs=logs,
     )
 
 
@@ -134,20 +139,25 @@ def load_config() -> Config:
 
 
 def setup_logging() -> logging.Logger:
+    """Create the logger with stderr handler only. File handler is added later
+    in Daemon.__init__() once we know whether logging is enabled."""
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     logger = logging.getLogger("herdr-llama-daemon")
     logger.setLevel(logging.INFO)
     fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
-
-    fh = logging.FileHandler(str(LOG_FILE))
-    fh.setFormatter(fmt)
-    logger.addHandler(fh)
 
     sh = logging.StreamHandler(sys.stderr)
     sh.setFormatter(fmt)
     logger.addHandler(sh)
 
     return logger
+
+
+def _add_file_handler(logger: logging.Logger) -> None:
+    """Add file handler if logs are enabled."""
+    fh = logging.FileHandler(str(LOG_FILE))
+    fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+    logger.addHandler(fh)
 
 
 logger = setup_logging()
@@ -215,9 +225,13 @@ class Herdr:
         return True
 
     def read_pane_source(
-        self, pane_id: str, source: str = "visible", lines: int = 10
+        self, pane_id: str, source: str = "recent-unwrapped", lines: int = 5
     ) -> str:
-        """Read recent pane output to detect inference activity."""
+        """Read recent pane output to detect inference activity.
+
+        Uses Popen + streaming line reader to avoid capturing the full pane
+        buffer into memory. Only keeps the last `lines` lines for regex parsing.
+        """
         cmd = [
             self.herdr_bin,
             "pane",
@@ -228,8 +242,29 @@ class Herdr:
             "--lines",
             str(lines),
         ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
-        return result.stdout.strip() if result.returncode == 0 else ""
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                bufsize=1,
+            )
+            last_lines: list[str] = []
+            for line in proc.stdout:  # type: ignore[union-attr]
+                last_lines.append(line.rstrip("\n"))
+                if len(last_lines) > lines:
+                    last_lines.pop(0)
+            # Grab any trailing data without a newline
+            trailing = proc.stdout.read() if proc.stdout else ""
+            if trailing:
+                last_lines.append(trailing.rstrip("\n"))
+                if len(last_lines) > lines:
+                    last_lines.pop(0)
+            proc.wait(timeout=10)
+            return "\n".join(last_lines).strip()
+        except (subprocess.TimeoutExpired, OSError):
+            return ""
 
 
 # ---------------------------------------------------------------------------
@@ -286,13 +321,20 @@ class LlamaClient:
         return False
 
     def wait_for_model_load(self, model_id: str, timeout: float = 120.0) -> bool:
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            info = self.get_model_info()
-            if info and info.get("id") == model_id and self.is_model_loaded():
-                return True
-            time.sleep(1.0)
-        return False
+        """Wait for model to load using herdr wait output (no HTTP calls)."""
+        result = subprocess.run(
+            [
+                "herdr", "wait", "output",
+                "--match", r"llama runner: waiting for requests",
+                "--source", "recent-unwrapped",
+                "--regex",
+                "--timeout", str(int(timeout * 1000)),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=int(timeout) + 5,
+        )
+        return result.returncode == 0
 
     def load_model(self, model_id: str) -> bool:
         try:
@@ -318,18 +360,36 @@ class LlamaClient:
             logger.error("Failed to unload model %s: %s", model_id, e)
             return False
 
-    def get_completions(self) -> dict | None:
+    def get_metrics(self, model_id: str) -> dict | None:
         try:
-            resp = self._client.get(f"{self.base_url}:{self.port}/completion")
+            resp = self._client.get(
+                f"{self.base_url}:{self.port}/metrics",
+                params={"model": model_id},
+            )
             resp.raise_for_status()
         except httpx.HTTPError as e:
-            logger.debug("Failed to get /completion: %s", e)
+            logger.debug("Failed to get /metrics: %s", e)
             return None
-        return resp.json()
+        result = {}
+        for line in resp.text.splitlines():
+            if line.startswith("#") or not line.strip():
+                continue
+            parts = line.split(None, 1)
+            if len(parts) != 2:
+                continue
+            name, value = parts
+            try:
+                result[name] = float(value)
+            except ValueError:
+                pass
+        return result
 
-    def get_slots(self) -> list[dict]:
+    def get_slots(self, model_id: str = "") -> list[dict]:
+        url = f"{self.base_url}:{self.port}/slots"
+        if model_id:
+            url += f"?model={model_id}"
         try:
-            resp = self._client.get(f"{self.base_url}:{self.port}/slots")
+            resp = self._client.get(url)
             resp.raise_for_status()
         except httpx.HTTPError as e:
             logger.debug("Failed to get /slots: %s", e)
@@ -387,6 +447,7 @@ class LlamaClient:
 # ---------------------------------------------------------------------------
 
 POLL_INTERVAL = 1.0
+HEALTH_CHECK_INTERVAL = 10.0  # seconds between health checks
 CONNECTION_RETRY_INTERVAL = 5.0
 CONNECTION_RETRY_MAX = 10
 
@@ -394,7 +455,6 @@ CONNECTION_RETRY_MAX = 10
 @dataclass
 class WatcherStats:
     tokens_per_sec: float | None = None
-    context_usage: float | None = None
     model_name: str | None = None
     model_id: str | None = None
     slots_active: int = 0
@@ -428,6 +488,10 @@ class Watcher:
         self._consecutive_errors = 0
         self._last_reported_agent_state: str | None = None
         self._last_reported_label: str | None = None
+        self._pane_source = "recent-unwrapped"
+        self._model_confirmed_loaded: bool = False
+        self._cached_model_info: dict | None = None
+        self._last_health_check: float = 0.0  # ponytail: track health check interval
 
     @property
     def stats(self) -> WatcherStats:
@@ -450,6 +514,8 @@ class Watcher:
 
     def _run(self) -> None:
         start_time = time.monotonic()
+        health_check_interval = 10.0  # seconds
+        last_health_check = 0.0
         while not self._stop_event.is_set():
             try:
                 self._poll_once()
@@ -461,25 +527,34 @@ class Watcher:
                 logger.warning("Watcher poll error: %s", e)
                 if self._consecutive_errors >= CONNECTION_RETRY_MAX:
                     elapsed = time.monotonic() - start_time
-                    logger.error(
-                        "Max connection retries reached (%d errors over %.0fs). Stopping watcher.",
+                    logger.warning(
+                        "Max connection retries reached (%d errors over %.0fs). Resetting.",
                         self._consecutive_errors,
                         elapsed,
                     )
-                    break
+                    self._consecutive_errors = 0
                 time.sleep(CONNECTION_RETRY_INTERVAL)
 
     def _poll_once(self) -> None:
+        # ponytail: health check every 10s, not every poll cycle
+        now = time.monotonic()
         server_was_online = self._stats.server_running
-        if not self.client.is_running():
-            self._stats.server_running = False
-            self._stats.error = "server not responding"
-            if self.pane_id:
-                self._report_state("blocked", "server offline")
-            if self.daemon and server_was_online:
-                logger.info("Watcher detected server offline")
-                self.daemon.state = DaemonState.NO_SERVER
-            return
+        if now - self._last_health_check > HEALTH_CHECK_INTERVAL or not server_was_online:
+            if not self.client.is_running():
+                self._stats.server_running = False
+                self._stats.error = "server not responding"
+                if self.pane_id:
+                    self._report_state("blocked", "server offline")
+                if self.daemon and server_was_online:
+                    logger.info("Watcher detected server offline")
+                    with self.daemon._lock:
+                        self.daemon.state = DaemonState.NO_SERVER
+                return
+            self._last_health_check = now
+        else:
+            # Trust previous health check result
+            if not server_was_online:
+                return
 
         self._stats.server_running = True
         self._stats.error = None
@@ -494,7 +569,11 @@ class Watcher:
             if label != self._last_reported_label:
                 self._report_metadata(state, label)
 
-        model_info = self.client.get_model_info()
+        # ponytail: skip /models if model confirmed loaded — trust cache
+        if self._model_confirmed_loaded and self._cached_model_info:
+            model_info = self._cached_model_info
+        else:
+            model_info = self.client.get_model_info()
         current_model = model_info.get("id") if model_info else None
         if current_model:
             self._stats.model_name = current_model
@@ -505,6 +584,9 @@ class Watcher:
 
         if self.daemon:
             if current_model and self._last_model != current_model:
+                # ponytail: model changed — reset cache
+                self._model_confirmed_loaded = False
+                self._cached_model_info = None
                 logger.info(
                     "[STATE-TRANSITION] model changed: %s -> %s, loaded=%s",
                     self._last_model,
@@ -516,6 +598,10 @@ class Watcher:
                     with self.daemon._lock:
                         self.daemon.current_model = current_model
                         self.daemon.state = DaemonState.MODEL_LOADED
+                    # ponytail: model confirmed loaded — skip /health (10s interval) and /models
+                    # on subsequent polls. Pane reading covers TPS and processing state.
+                    self._model_confirmed_loaded = True
+                    self._cached_model_info = model_info
                     # Register agent with model name and set state to idle
                     self._report_state("idle", "ready")
                 else:
@@ -527,6 +613,9 @@ class Watcher:
                 with self.daemon._lock:
                     self.daemon.current_model = None
                     self.daemon.state = DaemonState.SERVER_RUNNING
+                # ponytail: model unloaded — re-enable /health and /models polling
+                self._model_confirmed_loaded = False
+                self._cached_model_info = None
             elif current_model and self._last_model is None:
                 with self.daemon._lock:
                     self.daemon.current_model = current_model
@@ -536,6 +625,9 @@ class Watcher:
                         pass  # keep MODEL_LOADING, watcher will transition when loaded
                     elif self.client.is_model_loaded():
                         self.daemon.state = DaemonState.MODEL_LOADED
+                        # ponytail: cache model info for inference polling
+                        self._model_confirmed_loaded = True
+                        self._cached_model_info = model_info
                     else:
                         self.daemon.state = DaemonState.MODEL_LOADING
             elif not current_model and self._last_model is None:
@@ -552,9 +644,12 @@ class Watcher:
                             "Watcher detected model finished loading: %s", current_model
                         )
                         self.daemon.state = DaemonState.MODEL_LOADED
-                        # Confirm via /models — report loaded state
-                        self._report_state("unknown", "")
-                        self._report_metadata("unknown", "Loaded")
+                        # ponytail: cache model info — skip /models on next polls
+                        self._model_confirmed_loaded = True
+                        self._cached_model_info = model_info
+                        # Report loaded state
+                        self._report_state("idle", "")
+                        self._report_metadata("idle", "Loaded")
             elif self.daemon.state == DaemonState.MODEL_LOADING and not current_model:
                 with self.daemon._lock:
                     logger.info("Watcher detected model load failed")
@@ -562,17 +657,8 @@ class Watcher:
                     self.daemon.state = DaemonState.SERVER_RUNNING
             self._last_model = current_model
 
-        completion = self.client.get_completions()
-        if completion:
-            timings = completion.get("timings", {})
-            self._stats.tokens_per_sec = timings.get("predict_per_token_ms")
-            ctx_size = completion.get("context_size")
-            ctx_used = completion.get("n_past")
-            if ctx_size and ctx_used:
-                self._stats.context_usage = ctx_used / ctx_size
-
-        slots = self.client.get_slots()
-        self._stats.slots_active = sum(1 for s in slots if s.get("running"))
+        # ponytail: /metrics and /slots removed — pane reading covers TPS and processing state
+        # tokens_per_sec and slots_active are only used for CLI status display
 
         if self.pane_id:
             state, label = self._read_pane_state()
@@ -591,7 +677,9 @@ class Watcher:
         if not self._stats.server_running or not self.pane_id:
             return "idle", "on"
 
-        output = self.herdr.read_pane_source(self.pane_id, "visible", lines=5)
+        output = self.herdr.read_pane_source(
+            self.pane_id, self._pane_source, lines=5
+        )
         lines = output.splitlines()
         if not lines:
             if self._last_reported_agent_state:
@@ -627,9 +715,14 @@ class Watcher:
         if "stop processing" in last_line:
             return "idle", "ready"
 
-        # No signal — keep last known state.
+        # No signal — keep last known state, but during model loading
+        # report loading state instead of falling back to idle/on.
         if self._last_reported_agent_state:
+            if self.daemon and self.daemon.state == DaemonState.MODEL_LOADING:
+                return "working", "Loading..."
             return self._last_reported_agent_state, self._last_reported_label or "on"
+        if self.daemon and self.daemon.state == DaemonState.MODEL_LOADING:
+            return "working", "Loading..."
         return "idle", "on"
 
     def _report_state(self, state: str, message: str) -> None:
@@ -675,6 +768,8 @@ class Daemon:
 
     def __init__(self):
         self.config = load_config()
+        if self.config.logs:
+            _add_file_handler(logger)
         self.herdr = Herdr()
         self.client = LlamaClient(port=self.config.port)
         self.watcher: Watcher | None = None
@@ -702,12 +797,6 @@ class Daemon:
         )
 
         self._start_watcher()
-
-        # If a model is already loaded, report metadata immediately so the
-        # title shows up as soon as we know which pane to report to.
-        if self.client.is_model_loaded():
-            self._report_state("idle", "ready")
-            self._report_metadata(self._stats.state or "idle")
 
     def start(self) -> bool:
         """Start the daemon polling loop."""
@@ -783,6 +872,8 @@ class Daemon:
         if self.client.unload_model(model_id):
             if self.watcher:
                 self.watcher.stop()
+                self.watcher = None
+            self._start_watcher()
             return True
         # Restore state on failure
         with self._lock:
@@ -814,7 +905,6 @@ class Daemon:
             "state": state,
             "model": model if state != DaemonState.NO_SERVER else None,
             "tokens_per_sec": stats.tokens_per_sec,
-            "context_usage": stats.context_usage,
             "slots_active": stats.slots_active,
             "server_running": stats.server_running,
             "error": error,
@@ -931,16 +1021,20 @@ def start_socket_server(daemon: Daemon) -> socket.socket:
 
 def socket_loop(server_socket: socket.socket, daemon: Daemon) -> None:
     client_threads: list[threading.Thread] = []
+    _log_check_counter = 0
     while daemon._running:
+        _log_check_counter += 1
+        if _log_check_counter % 60 == 0:
+            _check_log_size()
+        client_threads = [t for t in client_threads if t.is_alive()]
         try:
             conn, _ = server_socket.accept()
             t = threading.Thread(
-                target=handle_client, args=(conn, daemon, server_socket), daemon=False
+                target=handle_client, args=(conn, daemon, server_socket), daemon=True
             )
             t.start()
             client_threads.append(t)
         except socket.timeout:
-            client_threads = [t for t in client_threads if t.is_alive()]
             continue
         except OSError:
             break
@@ -999,18 +1093,18 @@ def _send_command(command: str) -> dict:
 
 def _check_log_size() -> None:
     """Check if log file exceeds size limit and truncate if necessary."""
+    try:
+        config = load_config()
+    except ConfigError:
+        return
+    if not config.logs:
+        return
     if not LOG_FILE.exists():
         return
 
     size_bytes = LOG_FILE.stat().st_size
     size_kb = size_bytes / 1024
-
-    # Get config to check the limit
-    try:
-        config = load_config()
-        limit_kb = config.log_file_size
-    except ConfigError:
-        limit_kb = 5  # Default if config not available
+    limit_kb = config.log_file_size
 
     if size_kb > limit_kb:
         logger.info(
@@ -1044,6 +1138,13 @@ def _start_daemon():
 
     STATE_DIR.mkdir(parents=True, exist_ok=True)
 
+    cfg = _check_config()
+    if cfg is None:
+        sys.exit(1)
+
+    # Check log file size and truncate if necessary
+    _check_log_size()
+
     try:
         pid = os.fork()
         if pid > 0:
@@ -1055,14 +1156,9 @@ def _start_daemon():
 
     os.setsid()
     sys.stdin = open(os.devnull, "r")
-    sys.stdout = open(LOG_FILE, "a")
-    sys.stderr = open(LOG_FILE, "a")
-
-    if _check_config() is None:
-        sys.exit(1)
-
-    # Check log file size and truncate if necessary
-    _check_log_size()
+    if cfg.logs:
+        sys.stdout = open(LOG_FILE, "a")
+        sys.stderr = open(LOG_FILE, "a")
 
     try:
         daemon = Daemon()
@@ -1163,7 +1259,7 @@ def _run_foreground():
         socket_loop(server_socket, daemon)
 
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"Error: {e}", file=sys.stderr)
         logger.error("Daemon error", exc_info=True)
         sys.exit(1)
 

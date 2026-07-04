@@ -233,19 +233,41 @@ class Herdr:
                 return ws.get("workspace_id")
         return None
 
-    def read_pane_source(self, pane_id: str, source: str, lines: int = 2) -> str:
-        result = self._herdr(
-            "pane", "read", pane_id, "--source", source, "--lines", str(lines)
-        )
-        return result.stdout.strip() if result.returncode == 0 else ""
-
-    def notification_show(self, message: str) -> None:
-        cmd = [self.herdr_bin, "notification", "show", message]
+    def read_pane_source(self, pane_id: str, source: str = "recent-unwrapped", lines: int = 5) -> str:
+        """Read recent pane output. Uses Popen streaming to avoid capturing
+        the full pane buffer into memory."""
+        cmd = [
+            self.herdr_bin,
+            "pane",
+            "read",
+            pane_id,
+            "--source",
+            source,
+            "--lines",
+            str(lines),
+        ]
         try:
-            subprocess.run(cmd, capture_output=True, text=True, timeout=10)
-        except Exception:
-            pass
-
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                bufsize=1,
+            )
+            last_lines: list[str] = []
+            for line in proc.stdout:  # type: ignore[union-attr]
+                last_lines.append(line.rstrip("\n"))
+                if len(last_lines) > lines:
+                    last_lines.pop(0)
+            trailing = proc.stdout.read() if proc.stdout else ""
+            if trailing:
+                last_lines.append(trailing.rstrip("\n"))
+                if len(last_lines) > lines:
+                    last_lines.pop(0)
+            proc.wait(timeout=10)
+            return "\n".join(last_lines).strip()
+        except (subprocess.TimeoutExpired, OSError):
+            return ""
 
 # ---------------------------------------------------------------------------
 # Server Manager
@@ -291,6 +313,8 @@ class ServerManager:
 
     def stop(self) -> bool:
         self._kill_llama_server()
+        if self.pane_id:
+            self.herdr.close_pane(self.pane_id)
         if self.tab_id:
             self.herdr.close_tab(self.tab_id)
         self.tab_id = None
@@ -411,6 +435,8 @@ class ServerManager:
         cmd.extend(["--port", str(self.config["port"])])
         if self.config["extra_args"]:
             cmd.extend(self.config["extra_args"].split())
+        if "--metrics" not in cmd:
+            cmd.append("--metrics")
         return cmd
 
     def _health_check(self) -> bool:
@@ -697,10 +723,6 @@ def _ask_select(
     return inquirer.select(message, choices=choices, default=default).execute()
 
 
-def _ask_confirm(message: str, default: bool = False) -> bool:
-    return inquirer.confirm(message, default=default).execute()
-
-
 def _notify(body: str) -> None:
     subprocess.run(
         ["herdr", "notification", "show", "herdr-llama", "--body", body],
@@ -788,6 +810,7 @@ def _run_dashboard() -> None:
             return
 
         _tell_daemon_pane(True, tab_id, pane_id)
+        print("(--metrics auto-enabled for TPS stats)")
         _notify("Server and daemon running")
         return
 
@@ -849,6 +872,7 @@ def _run_dashboard() -> None:
             return
 
         _tell_daemon_pane(True, tab_id, pane_id)
+        print("(--metrics auto-enabled for TPS stats)")
         _notify("Server and daemon started")
         return
 

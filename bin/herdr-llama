@@ -10,4 +10,4 @@ herdr="${HERDR_BIN_PATH:-herdr}"
 original_tab_id="$(herdr pane current 2>/dev/null | jq -r '.result.pane.tab_id')"
 export HERDR_TAB_ID="$original_tab_id"
 
-exec "$herdr" plugin pane open --plugin herdr.llama-server --entrypoint dashboard --placement overlay --focus
+exec "$herdr" plugin pane open --plugin herdr-llama --entrypoint dashboard --placement overlay --focus

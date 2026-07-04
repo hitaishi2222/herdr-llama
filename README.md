@@ -2,13 +2,13 @@
 
 A [Herdr](https://github.com/nicehash/herdr) plugin that integrates [llama-server](https://github.com/ggml-org/llama.cpp/tree/master/examples/server) as an agent with a real-time stats dashboard.
 
-**Trigger**: `alt+l` opens an overlay for model selection and server control. A background daemon continuously polls llama-server and reports tokens/sec, context usage, and slot status to Herdr.
+**Trigger**: `alt+l` opens an overlay for model selection and server control. A background daemon continuously polls llama-server and reports tokens/sec, processing state, and slot status to Herdr.
 
 ## Architecture
 
 Two processes work together:
 
-- **Daemon** (`herdr-llama-daemon.py`): Long-lived background process that polls llama-server HTTP API every 1s, calls `report-agent`/`report-metadata` based on state, exposes state via Unix socket. Does NOT manage server lifecycle.
+- **Daemon** (`herdr-llama-daemon.py`): Long-lived background process that polls llama-server HTTP API (`/health`, `/models`, `/metrics`, `/slots`) every 1s, calls `report-agent`/`report-metadata` based on state, exposes state via Unix socket. Does NOT manage server lifecycle.
 - **InquirerPy app** (`herdr-llama.py`): Handles server lifecycle (start/stop via herdr CLI), daemon lifecycle, and the interactive dashboard. Starts the daemon if not running, sends commands via Unix socket.
 
 ```
@@ -23,7 +23,7 @@ herdr-llama.py (InquirerPy app)
           │
           ▼
 herdr-llama-daemon.py (Daemon)
-    ├── Polls llama-server HTTP API every 1s (Watcher thread)
+    ├── Polls llama-server HTTP API (health/models/metrics/slots) every 1s (Watcher thread)
     ├── Calls report-agent / report-metadata based on state
     └── Exposes state via Unix socket for InquirerPy app
 ```
@@ -31,9 +31,10 @@ herdr-llama-daemon.py (Daemon)
 ## Features
 
 - **One-shot dashboard**: Start server, load/unload models, stop server — all from a single overlay
-- **Real-time stats**: Background daemon polls every 1s and reports to Herdr agent system
+- **Real-time stats**: Background daemon polls `/metrics` every 1s and reports TPS + processing state to Herdr agent system
 - **State-aware**: Agent state maps to server/model state (idle/working/blocked)
 - **Crash detection**: Daemon detects server crashes via health check, sends notification
+- **`--metrics` auto-enable**: Plugin automatically adds `--metrics` flag when starting llama-server for TPS polling
 - **Persistent daemon**: Daemon keeps running after dashboard closes, continues polling
 
 ## Installation
@@ -99,11 +100,12 @@ update-rate = 1
 | `llama-server-path` | Yes | — | Path to the `llama-server` binary |
 | `models-preset` | No | — | Path to a `.ini` model preset file |
 | `port` | Yes | `8080` | Port for llama-server to listen on |
-| `extra-args` | No | — | Additional CLI args (space-separated) |
+| `extra-args` | No | — | Additional CLI args (space-separated). `--metrics` is auto-added for TPS polling, no need to include it here. |
 | `default-model` | No | — | Default model name for agent reporting |
 | `open-method` | No | `tab` | Where to run server: `tab` (focused workspace) or `workspace` (new workspace) |
 | `log-file-size` | No | `5` | Daemon log rotation threshold in KB |
 | `update-rate` | No | `1` | Polling interval in seconds (accepts float, e.g. `0.5` for 500ms) |
+| `logs` | No | `false` | Enable daemon log file. Set to `true` to enable file logging |
 
 ### Model Preset
 
@@ -141,7 +143,7 @@ Press `alt+l` to open the dashboard overlay:
 2. **Server running, no model** → Select a model → model loads, dashboard closes
 3. **Model loaded** → Choose: Unload / Stop server / Quit
 
-After loading a model, the daemon's watcher thread polls every 1 second and reports stats (tokens/sec, context usage, slot status) to Herdr via `report-agent`/`report-metadata`.
+After loading a model, the daemon's watcher thread polls every 1 second and reports stats (tokens/sec, slot processing state) to Herdr via `report-agent`/`report-metadata`.
 
 ### Startup Cases
 
@@ -166,7 +168,7 @@ The InquirerPy app communicates with the daemon via a Unix socket:
 
 | Command | Args | Response |
 |---------|------|----------|
-| `status` | — | `{"state": "...", "model": "...", "tokens_per_sec": ..., "context_usage": ..., "error": null, "tab_id": ..., "pane_id": ...}` |
+| `status` | — | `{"state": "...", "model": "...", "tokens_per_sec": ..., "error": null, "tab_id": ..., "pane_id": ...}` |
 | `set-pane` | `<tab_id> <pane_id>` | `{"ok": true}` |
 | `start` | — | `{"ok": true, "state": "..."}` or `{"error": "..."}` |
 | `load` | `<model_id>` | `{"ok": true, "state": "...", "model": "..."}` or `{"error": "..."}` |
@@ -222,8 +224,8 @@ State transitions are driven by the Watcher thread polling every 1s.
 | Endpoint | Method | Purpose |
 |---|---|---|
 | `/health` | GET | Server health check |
-| `/completion` | GET | Last completion stats (tokens/sec, context) |
-| `/slots` | GET | Slot status (active/inactive) |
+| `/metrics` | GET | Prometheus metrics (TPS, prompt speed, processing count) — requires `--metrics` flag |
+| `/slots` | GET | Slot processing state (`?model=<id>`) |
 | `/models` | GET | Current model info + model list |
 | `/models/load` | POST | Load a model (`{"model": "<id>"}`) |
 | `/models/unload` | POST | Unload a model (`{"model": "<id>"}`) |
@@ -243,9 +245,9 @@ herdr-llama/
 
 ## Daemon Logging
 
-Daemon logs to `~/.config/herdr/plugins/state/herdr-llama/daemon.log`.
+File logging is disabled by default. Set `logs = true` in config to enable logging to `~/.config/herdr/plugins/state/herdr-llama/daemon.log`.
 
-Log rotation: when the log exceeds `log-file-size` KB (default 5KB), the daemon sends a herdr notification and truncates the log.
+Log rotation: the daemon periodically checks log size every ~60s. When it exceeds `log-file-size` KB (default 5KB), the daemon sends a herdr notification and truncates the log.
 
 ## Troubleshooting
 
