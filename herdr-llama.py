@@ -15,6 +15,7 @@ Daemon (herdr-llama-daemon.py) handles only:
 
 import configparser
 import json
+import logging
 import os
 import socket
 import subprocess
@@ -23,6 +24,8 @@ import time
 from pathlib import Path
 
 from InquirerPy import inquirer
+
+logger = logging.getLogger("herdr-llama")
 
 PLUGIN_ID = "herdr-llama"
 CONFIG_FILENAME = "herdr-llama.ini"
@@ -175,15 +178,24 @@ class Herdr:
                     continue
         return 0
 
-    def create_workspace(self, label: str = "") -> str | None:
-        args = ["workspace", "create", "--focus"]
+    def create_workspace(self, label: str = "") -> tuple[str | None, str | None, str | None]:
+        """Create a workspace, return (ws_id, tab_id, pane_id) from the JSON output."""
+        args = ["workspace", "create"]
         if label:
             args.extend(["--label", label])
         result = self._herdr(*args)
         if result.returncode != 0:
-            return None
+            return None, None, None
         data = self._json(result)
-        return data.get("workspace", {}).get("id") if data else None
+        if not data:
+            return None, None, None
+        ws = data.get("workspace", {})
+        rp = data.get("root_pane", {})
+        return (
+            ws.get("workspace_id"),
+            ws.get("active_tab_id"),
+            rp.get("pane_id"),
+        )
 
     def create_tab(self, ws_id: str, label: str = "") -> str | None:
         args = ["tab", "create", "--workspace", ws_id]
@@ -369,6 +381,7 @@ class ServerManager:
             except ProcessLookupError:
                 continue
             except PermissionError:
+                logger.warning("Permission denied: cannot kill process %d", pid)
                 continue
             killed = True
             for _ in range(10):
@@ -403,30 +416,17 @@ class ServerManager:
         return tab_id
 
     def _start_in_workspace(self) -> str | None:
-        ws_id = self.herdr.create_workspace("llama-server")
-        if not ws_id:
+        ws_id, tab_id, pane_id = self.herdr.create_workspace("llama-server")
+        if not ws_id or not tab_id or not pane_id:
             return None
-        result = self.herdr._herdr("workspace", "get", ws_id)
-        if result.returncode != 0:
-            return None
-        data = self.herdr._json(result)
-        if not data:
-            return None
-        tabs = data.get("workspace", {}).get("tabs", [])
-        if not tabs:
-            return None
-        self.tab_id = tabs[0].get("tab_id")
-        if not self.tab_id:
-            return None
-        pane = self.herdr.find_pane(self.tab_id)
-        if not pane:
-            return None
-        self.pane_id = pane.get("pane_id")
+        self.pane_id = pane_id
+        self.tab_id = tab_id
         cmd = self._build_command()
-        if not self.herdr.run_in_pane(self.pane_id, " ".join(cmd)):
+        result = self.herdr._herdr("pane", "run", pane_id, " ".join(cmd))
+        if result.returncode != 0:
             print("[red]Failed to run llama-server in pane[/red]")
             return None
-        return self.tab_id
+        return tab_id
 
     def _build_command(self) -> list[str]:
         cmd = [self.config["llama_server_path"]]
@@ -650,7 +650,7 @@ def _is_daemon_running() -> bool:
 
 
 def _close_daemon_gracefully() -> bool:
-    """Stop daemon via socket, confirm socket file is gone."""
+    """Stop daemon via socket, confirm process is gone."""
     try:
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         s.settimeout(3.0)
@@ -661,11 +661,19 @@ def _close_daemon_gracefully() -> bool:
     except (socket.error, FileNotFoundError, OSError):
         pass
 
-    for _ in range(6):
-        if not SOCKET_PATH.exists():
+    # Wait for daemon process to exit (not just socket file)
+    for _ in range(12):  # 6 seconds total
+        if not _is_daemon_running():
             return True
         time.sleep(0.5)
-    return False
+
+    # Fallback: check if process is actually gone via pgrep
+    result = subprocess.run(
+        ["pgrep", "-f", "herdr-llama-daemon.py"],
+        capture_output=True,
+        text=True,
+    )
+    return result.returncode != 0
 
 
 def _send_command(command: str) -> dict:
@@ -682,7 +690,6 @@ def _send_command(command: str) -> dict:
             data += chunk
             if b"\n" in data:
                 break
-        s.close()
         return json.loads(data.decode("utf-8").strip())
     except Exception as e:
         return {"error": str(e)}

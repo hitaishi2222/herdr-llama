@@ -583,78 +583,28 @@ class Watcher:
             self._stats.model_id = None
 
         if self.daemon:
-            if current_model and self._last_model != current_model:
-                # ponytail: model changed — reset cache
-                self._model_confirmed_loaded = False
-                self._cached_model_info = None
-                logger.info(
-                    "[STATE-TRANSITION] model changed: %s -> %s, loaded=%s",
-                    self._last_model,
-                    current_model,
-                    self.client.is_model_loaded(),
-                )
-                if self.client.is_model_loaded():
-                    logger.info("Watcher detected model loaded: %s", current_model)
-                    with self.daemon._lock:
-                        self.daemon.current_model = current_model
-                        self.daemon.state = DaemonState.MODEL_LOADED
-                    # ponytail: model confirmed loaded — skip /health (10s interval) and /models
-                    # on subsequent polls. Pane reading covers TPS and processing state.
-                    self._model_confirmed_loaded = True
-                    self._cached_model_info = model_info
-                    # Register agent with model name and set state to idle
+            # Extract state transition logic
+            new_state, new_model, should_cache = self._transitions(
+                current_model, self._last_model, self.daemon.state
+            )
+
+            # Apply state transition
+            with self.daemon._lock:
+                self.daemon.state = new_state
+                self.daemon.current_model = new_model
+
+            # Handle side effects
+            if should_cache and current_model:
+                self._model_confirmed_loaded = True
+                self._cached_model_info = model_info
+                if self._last_model != current_model:
                     self._report_state("idle", "ready")
                 else:
-                    with self.daemon._lock:
-                        self.daemon.state = DaemonState.MODEL_LOADING
-                        self.daemon.current_model = current_model
-            elif not current_model and self._last_model:
-                logger.info("Watcher detected model unloaded")
-                with self.daemon._lock:
-                    self.daemon.current_model = None
-                    self.daemon.state = DaemonState.SERVER_RUNNING
-                # ponytail: model unloaded — re-enable /health and /models polling
-                self._model_confirmed_loaded = False
-                self._cached_model_info = None
-            elif current_model and self._last_model is None:
-                with self.daemon._lock:
-                    self.daemon.current_model = current_model
-                    # Honor the state set by load_model() (MODEL_LOADING)
-                    # or detect immediate load. Don't override to SERVER_RUNNING.
-                    if self.daemon.state == DaemonState.MODEL_LOADING:
-                        pass  # keep MODEL_LOADING, watcher will transition when loaded
-                    elif self.client.is_model_loaded():
-                        self.daemon.state = DaemonState.MODEL_LOADED
-                        # ponytail: cache model info for inference polling
-                        self._model_confirmed_loaded = True
-                        self._cached_model_info = model_info
-                    else:
-                        self.daemon.state = DaemonState.MODEL_LOADING
-            elif not current_model and self._last_model is None:
-                with self.daemon._lock:
-                    if self.daemon.state == DaemonState.NO_SERVER:
-                        self.daemon.state = DaemonState.SERVER_RUNNING
-            elif current_model and self._last_model == current_model:
-                with self.daemon._lock:
-                    if (
-                        self.daemon.state == DaemonState.MODEL_LOADING
-                        and self.client.is_model_loaded()
-                    ):
-                        logger.info(
-                            "Watcher detected model finished loading: %s", current_model
-                        )
-                        self.daemon.state = DaemonState.MODEL_LOADED
-                        # ponytail: cache model info — skip /models on next polls
-                        self._model_confirmed_loaded = True
-                        self._cached_model_info = model_info
-                        # Report loaded state
-                        self._report_state("idle", "")
-                        self._report_metadata("idle", "Loaded")
-            elif self.daemon.state == DaemonState.MODEL_LOADING and not current_model:
-                with self.daemon._lock:
-                    logger.info("Watcher detected model load failed")
-                    self.daemon.current_model = None
-                    self.daemon.state = DaemonState.SERVER_RUNNING
+                    self._report_state("idle", "")
+                    self._report_metadata("idle", "Loaded")
+            elif not should_cache and current_model:
+                if self._last_model != current_model:
+                    self._report_state("working", "Loading...")
             self._last_model = current_model
 
         # ponytail: /metrics and /slots removed — pane reading covers TPS and processing state
@@ -671,6 +621,59 @@ class Watcher:
                 self._report_state(state, "")
             if label_changed:
                 self._report_metadata(state, label)
+
+    def _transitions(
+        self, current_model: str | None, last_model: str | None, state: str
+    ) -> tuple[str, str | None, bool]:
+        """Determine next daemon state based on model changes.
+
+        Each rule is one condition, one return. Ordered: disappearance →
+        reappearance → change → completion → fallback.
+
+        Returns (new_state, new_model, should_cache).
+        """
+        # Rule 1: model disappeared
+        if not current_model and last_model:
+            return DaemonState.SERVER_RUNNING, None, False
+
+        # Rule 2: was loading, model gone
+        if state == DaemonState.MODEL_LOADING and not current_model:
+            return DaemonState.SERVER_RUNNING, None, False
+
+        # Rule 3: no model, was no model
+        if not current_model and last_model is None:
+            if state == DaemonState.NO_SERVER:
+                return DaemonState.SERVER_RUNNING, None, False
+            return state, None, False
+
+        # Rule 4: model just appeared
+        if last_model is None:
+            if self.daemon and self.daemon.state == DaemonState.MODEL_LOADING:
+                return DaemonState.MODEL_LOADING, current_model, False
+            if self.client.is_model_loaded():
+                return DaemonState.MODEL_LOADED, current_model, True
+            return DaemonState.MODEL_LOADING, current_model, False
+
+        # Rule 5: model changed
+        if current_model != last_model:
+            if self.client.is_model_loaded():
+                return DaemonState.MODEL_LOADED, current_model, True
+            return DaemonState.MODEL_LOADING, current_model, False
+
+        # Rule 6: same model, loading completed
+        if (
+            self.daemon
+            and self.daemon.state == DaemonState.MODEL_LOADING
+            and self.client.is_model_loaded()
+        ):
+            return DaemonState.MODEL_LOADED, current_model, True
+
+        # Rule 7: same model, still loading
+        if state == DaemonState.MODEL_LOADING:
+            return DaemonState.MODEL_LOADING, current_model, False
+
+        # Rule 8: same model, other state — keep state
+        return state, current_model, False
 
     def _read_pane_state(self) -> tuple[str, str]:
         """Find all signals in output, return the last (most recent) match."""
@@ -883,17 +886,25 @@ class Daemon:
 
     def get_status(self) -> dict:
         """Get current daemon status."""
-        with self._lock:
-            # Sync with actual server state if we have a pane
-            if self.pane_id:
+        # Sync with actual server state if we have a pane — HTTP calls outside lock
+        new_model = None
+        new_state = self.state
+        if self.pane_id:
+            try:
                 if self.client.is_model_loaded():
                     model_info = self.client.get_model_info()
-                    self.current_model = model_info.get("id") if model_info else None
-                    self.state = DaemonState.MODEL_LOADED
+                    new_model = model_info.get("id") if model_info else None
+                    new_state = DaemonState.MODEL_LOADED
                 elif self.state == DaemonState.MODEL_LOADED:
-                    self.current_model = None
-                    self.state = DaemonState.SERVER_RUNNING
+                    new_model = None
+                    new_state = DaemonState.SERVER_RUNNING
+            except Exception as e:
+                logger.debug("get_status sync error: %s", e)
 
+        # Snapshot shared state under lock — fast, no network I/O
+        with self._lock:
+            self.current_model = new_model
+            self.state = new_state
             state = self.state
             model = self.current_model
             tab_id = self.tab_id
@@ -1080,8 +1091,6 @@ def _send_command(command: str) -> dict:
             data += chunk
             if b"\n" in data:
                 break
-        s.close()
-        return json.loads(data.decode("utf-8").strip())
     except Exception as e:
         return {"error": str(e)}
     finally:
@@ -1089,6 +1098,7 @@ def _send_command(command: str) -> dict:
             s.close()
         except Exception:
             pass
+    return json.loads(data.decode("utf-8").strip())
 
 
 def _check_log_size() -> None:
