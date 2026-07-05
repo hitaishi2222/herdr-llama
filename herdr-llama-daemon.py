@@ -156,7 +156,9 @@ def setup_logging() -> logging.Logger:
 def _add_file_handler(logger: logging.Logger) -> None:
     """Add file handler if logs are enabled."""
     fh = logging.FileHandler(str(LOG_FILE))
-    fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+    fh.setFormatter(
+        logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    )
     logger.addHandler(fh)
 
 
@@ -324,11 +326,16 @@ class LlamaClient:
         """Wait for model to load using herdr wait output (no HTTP calls)."""
         result = subprocess.run(
             [
-                "herdr", "wait", "output",
-                "--match", r"llama runner: waiting for requests",
-                "--source", "recent-unwrapped",
+                "herdr",
+                "wait",
+                "output",
+                "--match",
+                r"llama runner: waiting for requests",
+                "--source",
+                "recent-unwrapped",
                 "--regex",
-                "--timeout", str(int(timeout * 1000)),
+                "--timeout",
+                str(int(timeout * 1000)),
             ],
             capture_output=True,
             text=True,
@@ -539,7 +546,10 @@ class Watcher:
         # ponytail: health check every 10s, not every poll cycle
         now = time.monotonic()
         server_was_online = self._stats.server_running
-        if now - self._last_health_check > HEALTH_CHECK_INTERVAL or not server_was_online:
+        if (
+            now - self._last_health_check > HEALTH_CHECK_INTERVAL
+            or not server_was_online
+        ):
             if not self.client.is_running():
                 self._stats.server_running = False
                 self._stats.error = "server not responding"
@@ -600,8 +610,8 @@ class Watcher:
                 if self._last_model != current_model:
                     self._report_state("idle", "ready")
                 else:
-                    self._report_state("idle", "")
-                    self._report_metadata("idle", "Loaded")
+                    self._report_state("unknown", "")
+                    self._report_metadata("unknown", "Loaded")
             elif not should_cache and current_model:
                 if self._last_model != current_model:
                     self._report_state("working", "Loading...")
@@ -680,13 +690,14 @@ class Watcher:
         if not self._stats.server_running or not self.pane_id:
             return "idle", "on"
 
-        output = self.herdr.read_pane_source(
-            self.pane_id, self._pane_source, lines=5
-        )
+        output = self.herdr.read_pane_source(self.pane_id, self._pane_source, lines=5)
         lines = output.splitlines()
         if not lines:
             if self._last_reported_agent_state:
-                return self._last_reported_agent_state, self._last_reported_label or "on"
+                return (
+                    self._last_reported_agent_state,
+                    self._last_reported_label or "on",
+                )
             return "idle", "on"
 
         last_line = lines[-1].strip()
