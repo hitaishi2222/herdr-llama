@@ -8,7 +8,7 @@ A [Herdr](https://github.com/nicehash/herdr) plugin that integrates [llama-serve
 
 Two processes work together:
 
-- **Daemon** (`herdr-llama-daemon.py`): Long-lived background process that polls llama-server HTTP API (`/health`, `/models`, `/metrics`, `/slots`) every 1s, calls `report-agent`/`report-metadata` based on state, exposes state via Unix socket. Does NOT manage server lifecycle.
+- **Daemon** (`herdr-llama-daemon.py`): Long-lived background process that polls llama-server HTTP API (`/health` every 10s, `/models` every 1s) and reads the herdr pane output for TPS/processing state, calls `report-agent`/`report-metadata` based on state, exposes state via Unix socket. Does NOT manage server lifecycle.
 - **InquirerPy app** (`herdr-llama.py`): Handles server lifecycle (start/stop via herdr CLI), daemon lifecycle, and the interactive dashboard. Starts the daemon if not running, sends commands via Unix socket.
 
 ```
@@ -23,7 +23,7 @@ herdr-llama.py (InquirerPy app)
           │
           ▼
 herdr-llama-daemon.py (Daemon)
-    ├── Polls llama-server HTTP API (health/models/metrics/slots) every 1s (Watcher thread)
+    ├── Polls /health every 10s, /models every 1s, reads pane output for TPS/processing (Watcher thread)
     ├── Calls report-agent / report-metadata based on state
     └── Exposes state via Unix socket for InquirerPy app
 ```
@@ -31,10 +31,10 @@ herdr-llama-daemon.py (Daemon)
 ## Features
 
 - **One-shot dashboard**: Start server, load/unload models, stop server — all from a single overlay
-- **Real-time stats**: Background daemon polls `/metrics` every 1s and reports TPS + processing state to Herdr agent system
+- **Real-time stats**: Background daemon reads the herdr pane output for tokens/sec and processing state, reports to Herdr agent system
 - **State-aware**: Agent state maps to server/model state (idle/working/blocked)
 - **Crash detection**: Daemon detects server crashes via health check, sends notification
-- **`--metrics` auto-enable**: Plugin automatically adds `--metrics` flag when starting llama-server for TPS polling
+- **`--metrics` auto-enable**: Plugin automatically adds `--metrics` flag when starting llama-server
 - **Persistent daemon**: Daemon keeps running after dashboard closes, continues polling
 
 ## Installation
@@ -143,7 +143,7 @@ Press `alt+l` to open the dashboard overlay:
 2. **Server running, no model** → Select a model → model loads, dashboard closes
 3. **Model loaded** → Choose: Unload / Stop server / Quit
 
-After loading a model, the daemon's watcher thread polls every 1 second and reports stats (tokens/sec, slot processing state) to Herdr via `report-agent`/`report-metadata`.
+After loading a model, the daemon's watcher thread polls every 1 second and reads the herdr pane output to report tokens/sec and processing state to Herdr via `report-agent`/`report-metadata`.
 
 ### Startup Cases
 
@@ -223,12 +223,12 @@ State transitions are driven by the Watcher thread polling every 1s.
 
 | Endpoint | Method | Purpose |
 |---|---|---|
-| `/health` | GET | Server health check |
-| `/metrics` | GET | Prometheus metrics (TPS, prompt speed, processing count) — requires `--metrics` flag |
-| `/slots` | GET | Slot processing state (`?model=<id>`) |
-| `/models` | GET | Current model info + model list |
+| `/health` | GET | Server health check (every 10s) |
+| `/models` | GET | Current model info + model list (every 1s, cached after confirmed load) |
 | `/models/load` | POST | Load a model (`{"model": "<id>"}`) |
 | `/models/unload` | POST | Unload a model (`{"model": "<id>"}`) |
+
+TPS and processing state are read from the herdr pane output (not from `/metrics` or `/slots`).
 
 ## Directory Structure
 
