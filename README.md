@@ -64,6 +64,7 @@ port = 8080
 extra-args = --threads 4
 default-model = llama-3-8b
 open-method = tab
+dashboard-placement = popup
 update-rate = 1
 EOF
 ```
@@ -91,6 +92,7 @@ port = 8080
 extra-args = --threads 4
 default-model = llama-3-8b
 open-method = tab
+dashboard-placement = popup
 log-file-size = 5
 update-rate = 1
 ```
@@ -103,6 +105,7 @@ update-rate = 1
 | `extra-args` | No | — | Additional CLI args (space-separated). `--metrics` is auto-added for TPS polling, no need to include it here. |
 | `default-model` | No | — | Default model name for agent reporting |
 | `open-method` | No | `tab` | Where to run server: `tab` (focused workspace) or `workspace` (new workspace) |
+| `dashboard-placement` | No | `popup` | How the dashboard opens: `popup` (60% width, 40% height popup) or `overlay` (full overlay) |
 | `log-file-size` | No | `5` | Daemon log rotation threshold in KB |
 | `update-rate` | No | `1` | Polling interval in seconds (accepts float, e.g. `0.5` for 500ms) |
 | `logs` | No | `false` | Enable daemon log file. Set to `true` to enable file logging |

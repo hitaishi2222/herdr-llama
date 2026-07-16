@@ -208,6 +208,7 @@ class Herdr:
         pane_id: str,
         title: str | None = None,
         state_label: str | None = None,
+        info: str | None = None,
     ) -> bool:
         cmd = [
             self.herdr_bin,
@@ -221,6 +222,8 @@ class Herdr:
             cmd.extend(["--title", title])
         if state_label is not None:
             cmd.extend(["--state-label", state_label])
+        if info is not None:
+            cmd.extend(["--token", f"info={info}"])
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
         if result.returncode != 0:
             return False
@@ -291,27 +294,26 @@ class LlamaClient:
             return False
 
     def get_model_info(self) -> dict | None:
+        """Get first loaded/active model (legacy, single-model tracking)."""
+        loaded = self.get_loaded_models()
+        return loaded[0] if loaded else None
+
+    def get_loaded_models(self) -> list[dict]:
+        """Get all loaded models from /models endpoint."""
         try:
             resp = self._client.get(f"{self.base_url}:{self.port}/models")
             resp.raise_for_status()
         except httpx.HTTPError as e:
             logger.debug("Failed to get /models: %s", e)
-            return None
+            return []
         data = resp.json()
         models = data.get("data", [])
+        loaded = []
         for model in models:
             status = model.get("status", {})
             if isinstance(status, dict) and status.get("value") == "loaded":
-                return model
-        for model in models:
-            status = model.get("status", {})
-            if isinstance(status, dict) and status.get("value") not in (
-                "unloaded",
-                "error",
-                None,
-            ):
-                return model
-        return None
+                loaded.append(model)
+        return loaded
 
     def is_model_loaded(self) -> bool:
         info = self.get_model_info()
@@ -464,6 +466,7 @@ class WatcherStats:
     tokens_per_sec: float | None = None
     model_name: str | None = None
     model_id: str | None = None
+    loaded_model_ids: list[str] = None  # ponytail: track all loaded models
     slots_active: int = 0
     server_running: bool = False
     error: str | None = None
@@ -496,9 +499,8 @@ class Watcher:
         self._last_reported_agent_state: str | None = None
         self._last_reported_label: str | None = None
         self._pane_source = "recent-unwrapped"
-        self._model_confirmed_loaded: bool = False
-        self._cached_model_info: dict | None = None
-        self._last_health_check: float = 0.0  # ponytail: track health check interval
+        self._last_health_check: float = 0.0
+        self._last_loaded_model_ids: list[str] = []  # ponytail: track loaded models for change detection
 
     @property
     def stats(self) -> WatcherStats:
@@ -579,22 +581,37 @@ class Watcher:
             if label != self._last_reported_label:
                 self._report_metadata(state, label)
 
-        # ponytail: skip /models if model confirmed loaded — trust cache
-        if self._model_confirmed_loaded and self._cached_model_info:
-            model_info = self._cached_model_info
-        else:
-            model_info = self.client.get_model_info()
-        current_model = model_info.get("id") if model_info else None
-        if current_model:
-            self._stats.model_name = current_model
-            self._stats.model_id = current_model
+        # ponytail: fetch loaded models every 10s (along with health check)
+        loaded_models = self.client.get_loaded_models()
+        current_model_ids = [m.get("id") for m in loaded_models if m.get("id")]
+        self._stats.loaded_model_ids = current_model_ids
+
+        # Update primary model name (first loaded model for legacy compat)
+        if current_model_ids:
+            self._stats.model_name = current_model_ids[0]
+            self._stats.model_id = current_model_ids[0]
         else:
             self._stats.model_name = None
             self._stats.model_id = None
 
+        # Report when loaded models change
+        if self.pane_id and current_model_ids != self._last_loaded_model_ids:
+            if current_model_ids:
+                if len(current_model_ids) == 1:
+                    label = f"idle= {current_model_ids[0]}"
+                else:
+                    label = f"idle={"/".join(current_model_ids)}"
+                self._report_state("idle", "ready")
+                self._report_metadata("idle", label)
+            else:
+                self._report_state("idle", "ready-to-load")
+                self._report_metadata("idle", "idle=ready-to-load")
+            self._last_loaded_model_ids = current_model_ids
+
         if self.daemon:
-            # Extract state transition logic
-            new_state, new_model, should_cache = self._transitions(
+            # Extract state transition logic (using first model for legacy compat)
+            current_model = current_model_ids[0] if current_model_ids else None
+            new_state, new_model, _ = self._transitions(
                 current_model, self._last_model, self.daemon.state
             )
 
@@ -604,18 +621,14 @@ class Watcher:
                 self.daemon.current_model = new_model
 
             # Handle side effects
-            if should_cache and current_model:
-                self._model_confirmed_loaded = True
-                self._cached_model_info = model_info
-                if self._last_model != current_model:
+            if new_model and self._last_model != new_model:
+                if self.client.is_model_loaded():
                     self._report_state("idle", "ready")
                 else:
-                    self._report_state("unknown", "")
-                    self._report_metadata("unknown", "Loaded")
-            elif not should_cache and current_model:
-                if self._last_model != current_model:
-                    self._report_state("working", "Loading...")
-            self._last_model = current_model
+                    self._report_state("working", f"Loading {new_model}...")
+            elif not new_model and self._last_model:
+                self._report_state("idle", "ready-to-load")
+            self._last_model = new_model
 
         # ponytail: /metrics and /slots removed — pane reading covers TPS and processing state
         # tokens_per_sec and slots_active are only used for CLI status display
@@ -741,12 +754,11 @@ class Watcher:
 
     def _report_state(self, state: str, message: str) -> None:
         """Update agent state via report-agent (required before state-label)."""
-        model_name = self._stats.model_name or "unknown"
         valid_state = (
             state if state in ("idle", "working", "blocked", "unknown") else "unknown"
         )
 
-        self.herdr.report_agent(self.pane_id, model_name, valid_state, message)
+        self.herdr.report_agent(self.pane_id, "herdr_llama", valid_state, message)
         self._last_state = state
         self._last_reported_agent_state = valid_state
 
@@ -760,6 +772,7 @@ class Watcher:
             self.pane_id,
             title=title,
             state_label=label_value,
+            info=label,
         )
         self._last_reported_label = label_value
 
@@ -805,7 +818,7 @@ class Daemon:
         # Register agent once with herdr (creates the glacial widget overview)
         self.herdr.report_agent(
             pane_id,
-            agent="llama-server",
+            agent="herdr_llama",
             state="idle",
             message="ready",
         )

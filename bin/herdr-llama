@@ -10,4 +10,13 @@ herdr="${HERDR_BIN_PATH:-herdr}"
 original_tab_id="$(herdr pane current 2>/dev/null | jq -r '.result.pane.tab_id')"
 export HERDR_TAB_ID="$original_tab_id"
 
-exec "$herdr" plugin pane open --plugin herdr-llama --entrypoint dashboard --placement overlay --focus
+# Read dashboard-placement from config (default: overlay)
+config_dir="$HOME/.config/herdr/plugins/config/herdr-llama"
+placement=$(grep -oP 'dashboard-placement\s*=\s*\K.*' "$config_dir/herdr-llama.ini" 2>/dev/null || echo "popup")
+placement=$(echo "$placement" | tr -d '[:space:]')
+
+if [ "$placement" = "popup" ]; then
+    exec "$herdr" plugin pane open --plugin herdr-llama --entrypoint dashboard --placement popup --width "60%" --height "40%" --focus
+else
+    exec "$herdr" plugin pane open --plugin herdr-llama --entrypoint dashboard --placement overlay --focus
+fi
