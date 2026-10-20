@@ -300,4 +300,4 @@ echo "stop" | nc -U ~/.config/herdr/plugins/state/herdr-llama/daemon.sock
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).
