@@ -2,6 +2,12 @@
 
 A [Herdr](https://github.com/nicehash/herdr) plugin that integrates [llama-server](https://github.com/ggml-org/llama.cpp/tree/master/examples/server) as an agent with a real-time stats dashboard.
 
+<p>
+  <img src="https://github.com/hitaishi2222/herdr-llama/actions/workflows/ci.yml/badge.svg" alt="CI"/>
+  <img src="https://img.shields.io/badge/license-MIT-blue?style=flat-square"/>
+  <img src="https://img.shields.io/badge/requires-herdr-%E2%89%A5%200.7.0-blue?style=flat-square"/>
+</p>
+
 **Trigger**: `alt+l` opens an overlay for model selection and server control. A background daemon continuously polls llama-server and reports tokens/sec, processing state, and slot status to Herdr.
 
 ## Architecture
@@ -294,4 +300,4 @@ echo "stop" | nc -U ~/.config/herdr/plugins/state/herdr-llama/daemon.sock
 
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE).
